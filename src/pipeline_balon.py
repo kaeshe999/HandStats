@@ -146,6 +146,32 @@ def vuelo(tr, v_min=7.0, cos_min=0.8):
     return mejor
 
 
+def extender_atras(tr, C, pasos=12):
+    """Completa el inicio de la pista (salida del lanzamiento) extrapolando hacia atrás."""
+    tr = list(tr)
+    for _ in range(pasos):
+        if len(tr) < 2:
+            break
+        (ta, xa, ya), (tb, xb, yb) = tr[0], tr[1]
+        vx, vy = (xb - xa) / (tb - ta), (yb - ya) / (tb - ta)
+        mejor = None
+        for dt in (1, 2, 3, 4):
+            t = ta - dt
+            if t not in C:
+                continue
+            px, py = xa - vx * dt, ya - vy * dt
+            for x, y in C[t]:
+                d = np.hypot(x - px, y - py)
+                if d < 6 + 3 * dt and (mejor is None or d < mejor[0]):
+                    mejor = (d, (t, x, y))
+            if mejor:
+                break
+        if not mejor:
+            break
+        tr.insert(0, mejor[1])
+    return tr
+
+
 def dentro(poly, x, y):
     return cv2.pointPolygonTest(poly.reshape(-1, 1, 2), (float(x), float(y)), False) >= 0
 
@@ -168,8 +194,8 @@ def main():
     Ha = cv2.getPerspectiveTransform(esq, DST)
     xs, ys = esq[:, 0], esq[:, 1]
     gw, gh = xs.max() - xs.min(), ys.max() - ys.min()
-    roi = (max(0, xs.min() - gw * 0.4), min(w, xs.max() + gw * 1.5),
-           max(0, ys.min() - gh * 0.8), min(h, ys.max() + gh * 0.15))
+    # zona de búsqueda: todo el ancho (el tiro viene desde la cancha), en altura del arco
+    roi = (0, w, max(0, ys.min() - gh * 0.8), min(h, ys.max() + gh * 0.4))
 
     print("1/4 estabilizando...")
     Hs = estabilizar(frames[:N + 3], a.ref, int(ys.max() - gh * 0.1))
@@ -186,7 +212,7 @@ def main():
     if not pistas:
         print("No se encontró una pista de balón.")
         return
-    balon = max(pistas, key=lambda p: (vuelo(p), len(p)))
+    balon = extender_atras(max(pistas, key=lambda p: (vuelo(p), len(p))), C)
 
     print("4/4 analizando...")
     entrada, k_in, frenado = None, 0, False
@@ -206,6 +232,10 @@ def main():
             k_in = sum(dentro(esq, x, y) for _, x, y in balon[i:i + 8])
             frenado = v_desp < 0.4 * v_antes
             break
+    if entrada:  # después del gol el balón rebota/rueda: se corta la pista 0,4 s después
+        # (y se descartan puntos fuera del arco después de entrar: movimiento de la red)
+        balon = [p for p in balon if p[0] <= entrada[0] or
+                 (p[0] <= entrada[0] + 0.4 * fps and dentro(esq, p[1], p[2]))]
     res = {"resultado": "sin llegada al arco", "zona": "-"}
     if entrada:
         X, Y = cv2.perspectiveTransform(np.float32([[entrada[1:]]]), Ha)[0, 0]
@@ -237,10 +267,13 @@ def main():
     def proyectar(pts, Hm):
         return cv2.perspectiveTransform(np.float32(pts).reshape(-1, 1, 2), Hm).reshape(-1, 2)
 
-    x0, x1, y0, y1 = map(int, roi)
-    y0c, y1c = max(0, y0 - 20), min(h, y1 + 20)
-    Z = 3
-    zw, zh = (x1 - x0) * Z, (y1c - y0c) * Z
+    # recuadro del zoom: arco + trayectoria completa del balón
+    bx = np.concatenate([xs, [p[1] for p in balon]])
+    by = np.concatenate([ys, [p[2] for p in balon]])
+    x0, x1 = int(max(0, bx.min() - 25)), int(min(w, bx.max() + 25))
+    y0c, y1c = int(max(0, by.min() - gh * 0.6)), int(min(h, by.max() + gh * 0.3))
+    Z = float(np.clip(900 / (x1 - x0), 1.5, 4))
+    zw, zh = int((x1 - x0) * Z), int((y1c - y0c) * Z)
     tmp1, tmp2 = f"{a.salida}/_full.mp4", f"{a.salida}/_zoom.mp4"
     ini, fin = max(0, balon[0][0] - 45), min(N, balon[-1][0] + 20)
     vw1 = cv2.VideoWriter(tmp1, cv2.VideoWriter_fourcc(*"mp4v"), fps, (2 * w, h))
@@ -270,7 +303,7 @@ def main():
         cv2.putText(f, f"t={t / fps:5.2f}s", (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         m = M.get(t, np.zeros((h, w), np.uint8))
         mv = cv2.cvtColor(m, cv2.COLOR_GRAY2BGR)
-        cv2.rectangle(mv, (x0, y0), (x1, y1), (255, 120, 0), 1)
+        cv2.rectangle(mv, (int(roi[0]), int(roi[2])), (int(roi[1]) - 1, int(roi[3])), (255, 120, 0), 1)
         cv2.polylines(mv, [esq.astype(np.int32)], True, (0, 255, 255), 1)
         if t in pos:
             cv2.circle(mv, tuple(map(int, pos[t])), 8, (0, 255, 0), 2)
@@ -320,9 +353,7 @@ def main():
         cv2.circle(ref, (int(x), int(y)), 2, (0, 0, 255), -1)
     if entrada:
         cv2.circle(ref, (int(entrada[1]), int(entrada[2])), 7, (0, 255, 0), 2)
-    x0, x1, y0, y1 = map(int, roi)
-    crop = ref[max(0, y0 - 20):y1 + 20, max(0, x0):x1]
-    crop = cv2.resize(crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    crop = cv2.resize(ref[y0c:y1c, x0:x1], (zw, zh), interpolation=cv2.INTER_CUBIC)
     cv2.imwrite(f"{a.salida}/trayectoria_balon.png", crop)
     with open(f"{a.salida}/resultado.txt", "w") as fh:
         fh.write(f"{res}\npista: cuadros {balon[0][0]}-{balon[-1][0]}, {len(balon)} detecciones\n")
