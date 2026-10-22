@@ -1,0 +1,5 @@
+opencv-python>=4.8
+numpy>=1.24
+matplotlib>=3.7
+# solo para demo_arco.py --metodo yolo
+ultralytics>=8.0
